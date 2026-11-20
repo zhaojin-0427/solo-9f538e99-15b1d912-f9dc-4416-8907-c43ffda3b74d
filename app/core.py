@@ -41,6 +41,24 @@ class PublishBlocked(RuntimeError):
         self.pending = pending
 
 
+class SourceUnverified(RuntimeError):
+    """调整前来源无法核实（归档不完整或源草稿重放不一致）。"""
+
+
+class NotPlainText(RuntimeError):
+    """归档字幕不是纯文本（含 WebVTT 标签或字幕设置）。"""
+
+
+class AdjustmentImpossible(RuntimeError):
+    """在给定上限与移动量内无解。"""
+
+    def __init__(self, fragment_nos: list[str]):
+        self.fragment_nos = fragment_nos
+        super().__init__(
+            "片段 " + "、".join(fragment_nos) + " 内的字幕排不下"
+        )
+
+
 def parse_timestamp(value: str) -> int:
     """把时码解析为毫秒。接受 HH:MM:SS.mmm、MM:SS.mmm、HH:MM:SS,mmm 与纯毫秒。"""
     if value is None:
@@ -415,13 +433,32 @@ def pending_occurrences(
 
 
 def build_output(fragments: list[Fragment], decisions: dict[str, dict]) -> str:
-    entries: list[tuple[int, int, list[str]]] = []
-    for occ in flatten(fragments):
-        lines = decision_text(occ, decisions)
-        if not lines:
-            continue
-        entries.append((occ.out_start, occ.out_end, lines))
-    return build_vtt(entries)
+    entries = output_entries(fragments, decisions)
+    return build_vtt([(e["start_ms"], e["end_ms"], e["text_lines"]) for e in entries])
+
+
+def output_entries(
+    fragments: list[Fragment], decisions: dict[str, dict]
+) -> list[dict]:
+    """成品字幕的有序条目：节选起止、正文行、所属片段号与片段节选边界。"""
+    entries: list[dict] = []
+    for fragment in fragments:
+        for occ in fragment.occurrences:
+            lines = decision_text(occ, decisions)
+            if not lines:
+                continue
+            entries.append(
+                {
+                    "start_ms": occ.out_start,
+                    "end_ms": occ.out_end,
+                    "text_lines": lines,
+                    "text": "\n".join(lines),
+                    "fragment_no": occ.fragment_no,
+                    "fragment_excerpt_start": fragment.excerpt_start,
+                    "fragment_excerpt_end": fragment.excerpt_end,
+                }
+            )
+    return entries
 
 
 def inherited_decisions(
@@ -430,6 +467,191 @@ def inherited_decisions(
     """只沿用与当前出现签名（片段号 + 原字幕 + 原片范围）完全一致的校订。"""
     wanted = {occ.signature for occ in flatten(fragments) if occ.kind == CUT}
     return {sig: previous[sig] for sig in wanted if sig in previous}
+
+
+# ---------------------------------------------------------------------------
+# 调速：每秒字数上限 + 单端点最大移动量
+# ---------------------------------------------------------------------------
+
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def count_non_whitespace(text: str) -> int:
+    """字数按非空白字符计（换行、空格、制表等不计）。"""
+    return len("".join(text.split()))
+
+
+def ensure_plain_text(cues: Iterable[Cue]) -> None:
+    """只接受纯文本字幕：不得带 WebVTT 标签或字幕设置（位置/对齐等）。"""
+    for cue in cues:
+        if cue.settings.strip():
+            raise NotPlainText(
+                f"第 {cue.index + 1} 条字幕带设置行，不是纯文本字幕，无法调速"
+            )
+        if _TAG_RE.search(cue.text or ""):
+            raise NotPlainText(
+                f"第 {cue.index + 1} 条字幕含 WebVTT 标签，不是纯文本字幕，无法调速"
+            )
+
+
+@dataclass(frozen=True)
+class AdjustCue:
+    """调速输入的一条成品字幕（顺序即输出顺序，按片段分组）。"""
+
+    start_ms: int
+    end_ms: int
+    text: str
+    fragment_no: str
+    fragment_excerpt_start: int
+    fragment_excerpt_end: int
+
+
+@dataclass(frozen=True)
+class AdjustedCue:
+    start_ms: int
+    end_ms: int
+    text: str
+    fragment_no: str
+    max_shift_ms: int  # 本条起点/终点中移动最多的毫秒数
+
+
+def _group_by_fragment(cues: list[AdjustCue]) -> list[list[AdjustCue]]:
+    groups: list[list[AdjustCue]] = []
+    current: list[AdjustCue] = []
+    current_no = None
+    for cue in cues:
+        if cue.fragment_no != current_no:
+            if current:
+                groups.append(current)
+            current = []
+            current_no = cue.fragment_no
+        current.append(cue)
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _min_duration_ms(text: str, max_cps: int) -> int:
+    """字数/秒数不超过上限所需的最短整数毫秒：ceil(字数 * 1000 / cps)。"""
+    chars = count_non_whitespace(text)
+    if chars == 0:
+        # 正常归档不会出现空正文；防御性处理为不占用额外时长。
+        return 0
+    return (chars * 1000 + max_cps - 1) // max_cps
+
+def _feasible_group(group: list[AdjustCue], max_cps: int, shift: int) -> bool:
+    """在所有端点最多移动 shift 毫秒时，该片段内是否排得下。"""
+    earliest = group[0].fragment_excerpt_start
+    for cue in group:
+        low = max(cue.fragment_excerpt_start, cue.start_ms - shift)
+        high = min(cue.fragment_excerpt_end, cue.end_ms + shift)
+        need = _min_duration_ms(cue.text, max_cps)
+        start = max(earliest, low)
+        if start + need > high:
+            return False
+        earliest = start + need
+    return earliest <= group[-1].fragment_excerpt_end
+
+
+def _solve_group(
+    group: list[AdjustCue], max_cps: int, shift: int
+) -> list[tuple[int, int]]:
+    """在 shift 已可行的前提下，求一组确定的整数毫秒 (起, 止)。
+
+    先正向取最早可行位置，再反向取最晚可行位置，最后把每个端点尽量夹回原位；
+    顺序处理保证同片段相邻字幕可相接但不重叠。
+    """
+    need = [_min_duration_ms(cue.text, max_cps) for cue in group]
+    lows, highs = [], []
+    for cue in group:
+        lows.append(max(cue.fragment_excerpt_start, cue.start_ms - shift))
+        highs.append(min(cue.fragment_excerpt_end, cue.end_ms + shift))
+
+    # 正向：最早可行的起点
+    earliest_start: list[int] = []
+    floor = group[0].fragment_excerpt_start
+    for cue, low, dur in zip(group, lows, need):
+        start = max(floor, low)
+        earliest_start.append(start)
+        floor = start + dur
+
+    # 反向：最晚可行的起点
+    latest_start: list[int] = [0] * len(group)
+    ceiling = group[-1].fragment_excerpt_end
+    for idx in range(len(group) - 1, -1, -1):
+        start = min(ceiling - need[idx], highs[idx] - need[idx])
+        latest_start[idx] = start
+        ceiling = start
+
+    # 把起点尽量夹回原位（确定的平局规则），再用最早可行规则排后续。
+    starts: list[int] = []
+    floor = group[0].fragment_excerpt_start
+    for idx, cue in enumerate(group):
+        start = min(max(cue.start_ms, floor, lows[idx]), latest_start[idx])
+        starts.append(start)
+        floor = start + need[idx]
+
+    # 终点同样尽量夹回原位，但不得早于自身起点+最短时长、不得晚于下一条起点。
+    results: list[tuple[int, int]] = []
+    for idx, cue in enumerate(group):
+        start = starts[idx]
+        upper = highs[idx]
+        if idx + 1 < len(group):
+            upper = min(upper, starts[idx + 1])
+        end = max(start + need[idx], min(cue.end_ms, upper))
+        results.append((start, end))
+    return results
+
+
+def adjust_cues(
+    cues: list[AdjustCue], max_cps: int, max_shift_ms: int
+) -> list[AdjustedCue]:
+    """按每秒字数上限调速。
+
+    正文、顺序、条数不变；起止按整毫秒调整，留在各自原片段的节选范围内；
+    同片段相邻字幕可相接但不重叠；每个端点移动不超过 max_shift_ms；
+    在满足约束的前提下，让全版移动最多的那个起点/终点尽量少移（二分最小值）。
+    无解时抛出 AdjustmentImpossible，指出排不下的片段。
+    """
+    if not cues:
+        return []
+    groups = _group_by_fragment(cues)
+
+    # 先确认最大移动量下哪些片段根本排不下。
+    impossible = [
+        group[0].fragment_no
+        for group in groups
+        if not _feasible_group(group, max_cps, max_shift_ms)
+    ]
+    if impossible:
+        raise AdjustmentImpossible(impossible)
+
+    # 二分全版最小的最大移动量 D*（可行集合随 shift 单调扩大）。
+    lo, hi = 0, max_shift_ms
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if all(_feasible_group(group, max_cps, mid) for group in groups):
+            hi = mid
+        else:
+            lo = mid + 1
+    best_shift = lo
+
+    adjusted: list[AdjustedCue] = []
+    for group in groups:
+        solved = _solve_group(group, max_cps, best_shift)
+        for cue, (start, end) in zip(group, solved):
+            adjusted.append(
+                AdjustedCue(
+                    start_ms=start,
+                    end_ms=end,
+                    text=cue.text,
+                    fragment_no=cue.fragment_no,
+                    max_shift_ms=max(
+                        abs(start - cue.start_ms), abs(end - cue.end_ms)
+                    ),
+                )
+            )
+    return adjusted
 
 
 # ---------------------------------------------------------------------------
@@ -473,6 +695,19 @@ CREATE TABLE IF NOT EXISTS edition (
     cue_count INTEGER NOT NULL,
     source_draft_id INTEGER,
     vtt_blob BLOB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS edition_cue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    edition_id INTEGER NOT NULL REFERENCES edition(id) ON DELETE CASCADE,
+    cue_order INTEGER NOT NULL,
+    fragment_no TEXT NOT NULL,
+    fragment_excerpt_start INTEGER NOT NULL,
+    fragment_excerpt_end INTEGER NOT NULL,
+    start_ms INTEGER NOT NULL,
+    end_ms INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    UNIQUE (edition_id, cue_order)
 );
 """
 
@@ -694,7 +929,11 @@ def get_edition(conn: sqlite3.Connection, version_no: int) -> Optional[sqlite3.R
 
 
 def publish(conn: sqlite3.Connection, draft_id: int, expected_revision: int) -> int:
-    """发布：所有剪口处理完毕才写入新版；任何失败都不留新版本。"""
+    """发布：所有剪口处理完毕才写入新版；任何失败都不留新版本。
+
+    发布同时把每条成品字幕的片段号、片段节选起止与原件逐行归档到 edition_cue；
+    任一项写入失败都会随事务回滚，不会产生不完整的发布。
+    """
     conn.execute("BEGIN IMMEDIATE")
     try:
         row = _reject_if_stale(conn, draft_id, expected_revision)
@@ -705,15 +944,18 @@ def publish(conn: sqlite3.Connection, draft_id: int, expected_revision: int) -> 
         pending = pending_occurrences(fragments, decisions)
         if pending:
             raise PublishBlocked(pending)
-        vtt_text = build_output(fragments, decisions)
+        entries = output_entries(fragments, decisions)
+        vtt_text = build_vtt(
+            [(e["start_ms"], e["end_ms"], e["text_lines"]) for e in entries]
+        )
         blob = vtt_text.encode("utf-8")
         latest = conn.execute(
             "SELECT COALESCE(MAX(version_no), 0) AS v FROM edition"
         ).fetchone()["v"]
         version_no = latest + 1
         total_ms = sum(fragment.duration_ms for fragment in fragments)
-        cue_count = sum(1 for line in vtt_text.splitlines() if "-->" in line)
-        conn.execute(
+        cue_count = len(entries)
+        cursor = conn.execute(
             """
             INSERT INTO edition
                 (version_no, vtt_sha256, published_at, total_ms, cue_count,
@@ -730,6 +972,36 @@ def publish(conn: sqlite3.Connection, draft_id: int, expected_revision: int) -> 
                 blob,
             ),
         )
+        edition_id = cursor.lastrowid
+        conn.executemany(
+            """
+            INSERT INTO edition_cue
+                (edition_id, cue_order, fragment_no, fragment_excerpt_start,
+                 fragment_excerpt_end, start_ms, end_ms, text)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    edition_id,
+                    order,
+                    e["fragment_no"],
+                    e["fragment_excerpt_start"],
+                    e["fragment_excerpt_end"],
+                    e["start_ms"],
+                    e["end_ms"],
+                    e["text"],
+                )
+                for order, e in enumerate(entries)
+            ],
+        )
+        archived = conn.execute(
+            "SELECT COUNT(*) AS n FROM edition_cue WHERE edition_id = ?",
+            (edition_id,),
+        ).fetchone()["n"]
+        if archived != cue_count:
+            raise RuntimeError(
+                f"字幕归档不完整：应归档 {cue_count} 条，实际写入 {archived} 条"
+            )
         conn.execute(
             "UPDATE draft SET published_version = ? WHERE id = ?",
             (version_no, draft_id),
@@ -741,3 +1013,130 @@ def publish(conn: sqlite3.Connection, draft_id: int, expected_revision: int) -> 
     except Exception:
         conn.execute("ROLLBACK")
         raise
+
+
+# ---------------------------------------------------------------------------
+# 调速前的来源核实
+# ---------------------------------------------------------------------------
+
+
+def edition_cue_rows(conn: sqlite3.Connection, edition_id: int) -> list[sqlite3.Row]:
+    return list(
+        conn.execute(
+            "SELECT * FROM edition_cue WHERE edition_id = ? ORDER BY cue_order",
+            (edition_id,),
+        )
+    )
+
+
+def _entries_to_adjust_cues(entries: list[dict]) -> list[AdjustCue]:
+    return [
+        AdjustCue(
+            start_ms=e["start_ms"],
+            end_ms=e["end_ms"],
+            text=e["text"],
+            fragment_no=e["fragment_no"],
+            fragment_excerpt_start=e["fragment_excerpt_start"],
+            fragment_excerpt_end=e["fragment_excerpt_end"],
+        )
+        for e in entries
+    ]
+
+
+def _verify_archive(
+    edition: sqlite3.Row, rows: list[sqlite3.Row]
+) -> list[AdjustCue]:
+    """新发布版本：逐行归档须与归档原件完全对得上，才可据其调速。"""
+    blob_cues = parse_vtt(edition["vtt_blob"].decode("utf-8"))
+    if len(rows) != edition["cue_count"] or len(rows) != len(blob_cues):
+        raise SourceUnverified(
+            "逐行归档的字幕条数与发布原件不一致，来源无法核实"
+        )
+    cues: list[AdjustCue] = []
+    for row, cue in zip(rows, blob_cues):
+        if (
+            row["start_ms"] != cue.start_ms
+            or row["end_ms"] != cue.end_ms
+            or row["text"] != cue.text
+        ):
+            raise SourceUnverified(
+                "逐行归档的时码或正文与发布原件不一致，来源无法核实"
+            )
+        if not (
+            row["fragment_excerpt_start"] <= row["start_ms"]
+            and row["end_ms"] <= row["fragment_excerpt_end"]
+        ):
+            raise SourceUnverified(
+                "逐行归档的片段节选范围无法容纳该字幕，来源无法核实"
+            )
+        cues.append(
+            AdjustCue(
+                start_ms=row["start_ms"],
+                end_ms=row["end_ms"],
+                text=row["text"],
+                fragment_no=row["fragment_no"],
+                fragment_excerpt_start=row["fragment_excerpt_start"],
+                fragment_excerpt_end=row["fragment_excerpt_end"],
+            )
+        )
+    return cues
+
+
+def _replay_source(
+    conn: sqlite3.Connection, edition: sqlite3.Row
+) -> list[AdjustCue]:
+    """旧版（无逐行归档）：取发布时的源草稿重放，与归档原件逐字节一致才可调速。"""
+    draft_id = edition["source_draft_id"]
+    if draft_id is None:
+        raise SourceUnverified(
+            "该版本没有记录源草稿，也没有逐行归档，来源无法核实"
+        )
+    row = load_draft(conn, draft_id)
+    if row is None:
+        raise SourceUnverified(
+            "发布时的源草稿已被清理且该版本没有逐行归档，来源无法核实"
+        )
+    fragments = compute_occurrences(
+        _parse_cuts(row["cuts_json"]), parse_vtt(row["vtt_raw"])
+    )
+    entries = output_entries(fragments, decision_rows(conn, draft_id))
+    replay_blob = build_vtt(
+        [(e["start_ms"], e["end_ms"], e["text_lines"]) for e in entries]
+    ).encode("utf-8")
+    if replay_blob != edition["vtt_blob"]:
+        raise SourceUnverified(
+            "源草稿重放结果与归档原件逐字节不一致，来源无法核实"
+        )
+    return _entries_to_adjust_cues(entries)
+
+
+def prepare_adjustment(
+    conn: sqlite3.Connection, version_no: int, max_cps: int, max_shift_ms: int
+) -> Optional[list[AdjustedCue]]:
+    """核实来源并执行调速；版本不存在返回 None。
+
+    优先使用发布时的逐行归档（源草稿清理后仍可调整）；
+    没有归档的旧版改用发布时源草稿重放，逐字节比对通过才调整。
+    来源无法核实抛 SourceUnverified，无解抛 AdjustmentImpossible，均不产出调整件。
+    """
+    edition = get_edition(conn, version_no)
+    if edition is None:
+        return None
+    rows = edition_cue_rows(conn, edition["id"])
+    if rows:
+        adjust_cues_input = _verify_archive(edition, rows)
+    else:
+        adjust_cues_input = _replay_source(conn, edition)
+    # 只接受纯文本字幕（以归档原件为准）。
+    ensure_plain_text(parse_vtt(edition["vtt_blob"].decode("utf-8")))
+    return adjust_cues(adjust_cues_input, max_cps, max_shift_ms)
+
+
+def build_adjusted_vtt(adjusted: list[AdjustedCue]) -> str:
+    """按调速结果重建 WebVTT：正文、顺序、条数与原件一致，仅时码变化。"""
+    return build_vtt(
+        [
+            (cue.start_ms, cue.end_ms, cue.text.split("\n"))
+            for cue in adjusted
+        ]
+    )

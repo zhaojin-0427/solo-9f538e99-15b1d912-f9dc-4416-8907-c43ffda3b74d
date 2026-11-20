@@ -9,10 +9,37 @@
     <div><dt>总时长</dt><dd>{{ edition.total_ms | ts }}</dd></div>
   </dl>
   <p class="hint mono">SHA-256 {{ edition.vtt_sha256 }}</p>
-  <p><a class="button primary" href="{{ url_for('download', version_no=edition.version_no) }}">下载完整 WebVTT</a></p>
+  <p>
+    <a class="button primary" href="{{ url_for('download', version_no=edition.version_no) }}">下载归档原件 WebVTT</a>
+  </p>
 </section>
+
 <section class="panel">
-  <h2>文件内容</h2>
+  <h2>语速调整后下载</h2>
+  <p class="hint">
+    正文、顺序和条数与归档原件完全一致，仅按整毫秒调整起止时间：每条字幕字数（按非空白字符计）
+    除以显示秒数不超过上限；起止须留在各自原片段内，相邻字幕可相接但不重叠；
+    系统会让全版移动最多的那个起点或终点尽量少移。仅接受纯文本字幕。
+  </p>
+  {% if adjust_error %}
+  <div class="banner error">{{ adjust_error }}</div>
+  {% endif %}
+  <form method="post" action="{{ url_for('adjust', version_no=edition.version_no) }}" class="adjust-form">
+    <label>
+      <span>每秒字数上限（正整数）</span>
+      <input type="text" inputmode="numeric" name="max_cps" value="{{ form_cps }}" required>
+    </label>
+    <label>
+      <span>单端点最多可移动毫秒数（非负整数）</span>
+      <input type="text" inputmode="numeric" name="max_shift_ms" value="{{ form_shift }}" required>
+    </label>
+    <button type="submit" class="primary">下载调整后的 WebVTT</button>
+  </form>
+  <p class="hint">来源无法核实或无可行解时不会提供调整件；原下载链接始终返回归档原件。</p>
+</section>
+
+<section class="panel">
+  <h2>归档原件内容</h2>
   <pre class="vtt">{{ body }}</pre>
 </section>
 {% endblock %}

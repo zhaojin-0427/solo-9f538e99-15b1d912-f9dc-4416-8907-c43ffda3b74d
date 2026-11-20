@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 from pathlib import Path
 
 from flask import (
@@ -186,7 +187,14 @@ def create_app(database_path: str | None = None) -> Flask:
         if edition is None:
             abort(404)
         body = edition["vtt_blob"].decode("utf-8")
-        return render_template("edition.html", edition=edition, body=body)
+        return render_template(
+            "edition.html",
+            edition=edition,
+            body=body,
+            adjust_error=None,
+            form_cps="",
+            form_shift="",
+        )
 
     @app.get("/editions/<int:version_no>/download")
     def download(version_no: int):
@@ -201,6 +209,53 @@ def create_app(database_path: str | None = None) -> Flask:
             download_name=f"oral-history-v{version_no}.vtt",
             max_age=0,
         )
+
+    @app.post("/editions/<int:version_no>/adjust")
+    def adjust(version_no: int):
+        conn = get_db()
+        edition = core.get_edition(conn, version_no)
+        if edition is None:
+            abort(404)
+        cps_raw = (request.form.get("max_cps") or "").strip()
+        shift_raw = (request.form.get("max_shift_ms") or "").strip()
+
+        def _fail(message: str, status: int = 422):
+            body = edition["vtt_blob"].decode("utf-8")
+            page = render_template(
+                "edition.html",
+                edition=edition,
+                body=body,
+                adjust_error=message,
+                form_cps=cps_raw,
+                form_shift=shift_raw,
+            )
+            return page, status
+
+        # 正整数 / 非负整数：只接受十进制整数字面量。
+        if not re.fullmatch(r"[0-9]+", cps_raw) or int(cps_raw) < 1:
+            return _fail("每秒字数上限必须是正整数。", 400)
+        if not re.fullmatch(r"[0-9]+", shift_raw):
+            return _fail("单端点最多可移动毫秒数必须是非负整数。", 400)
+        max_cps, max_shift_ms = int(cps_raw), int(shift_raw)
+        try:
+            adjusted = core.prepare_adjustment(conn, version_no, max_cps, max_shift_ms)
+        except core.SourceUnverified as exc:
+            return _fail(f"来源无法核实：{exc}，不提供调整件。")
+        except core.NotPlainText as exc:
+            return _fail(f"{exc}，不提供调整件。")
+        except core.AdjustmentImpossible as exc:
+            return _fail(f"无解：{exc}；请放宽上限或移动量。不提供调整件。")
+        if adjusted is None:
+            abort(404)
+        adjusted_text = core.build_adjusted_vtt(adjusted)
+        best_shift = max((cue.max_shift_ms for cue in adjusted), default=0)
+        return send_file(
+            io.BytesIO(adjusted_text.encode("utf-8")),
+            mimetype="text/vtt",
+            as_attachment=True,
+            download_name=f"oral-history-v{version_no}-adjusted-cps{max_cps}.vtt",
+            max_age=0,
+        ), {"X-Max-Shift-Ms": str(best_shift)}
 
     return app
 

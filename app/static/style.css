@@ -65,6 +65,10 @@ main { max-width: 1100px; margin: 0 auto; padding: 1.5rem 1rem 4rem; }
 .upload-form label { display: grid; gap: .3rem; }
 .upload-form span { font-weight: 600; }
 
+.adjust-form { display: flex; flex-wrap: wrap; gap: .9rem; align-items: end; max-width: 760px; }
+.adjust-form label { display: grid; gap: .3rem; }
+.adjust-form input { font: inherit; padding: .45rem .55rem; border: 1px solid var(--line); border-radius: 4px; min-width: 16rem; }
+
 button, .button {
   display: inline-block;
   font: inherit;
